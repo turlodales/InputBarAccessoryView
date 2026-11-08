@@ -28,7 +28,6 @@
 import UIKit
 
 /// An object that observes keyboard notifications such that event callbacks can be set for each notification
-@available(iOSApplicationExtension, unavailable)
 open class KeyboardManager: NSObject, UIGestureRecognizerDelegate {
 
     /// A callback that passes a `KeyboardNotification` as an input
@@ -49,6 +48,9 @@ open class KeyboardManager: NSObject, UIGestureRecognizerDelegate {
 
     /// Closure for providing an additional bottom constraint constant for `InputAccessoryView`
     public var additionalInputViewBottomConstraintConstant: () -> CGFloat = { 0 }
+
+    /// Close run with the animation during a transition
+    public var transition: ((KeyboardNotification) -> Void)?
 
     // MARK: - Properties [Private]
 
@@ -146,8 +148,17 @@ open class KeyboardManager: NSObject, UIGestureRecognizerDelegate {
     /// When e.g. using pagesheets on iPad the inputAccessoryView is not stuck to the bottom of the screen.
     /// This value represents the size of the gap between the bottom of the screen and the bottom of the inputAccessoryView.
     private var bottomGap: CGFloat {
-        if let inputAccessoryView = inputAccessoryView, let window = inputAccessoryView.window, let superView = inputAccessoryView.superview {
-            return window.frame.height - superView.convert(superView.frame, to: window).maxY
+        if let inputAccessoryView = inputAccessoryView,
+            inputAccessoryView.traitCollection.userInterfaceIdiom == .pad,
+            let window = inputAccessoryView.window,
+            let superView = inputAccessoryView.superview
+        {
+            var height = window.bounds.height
+            if let rootViewController = window.rootViewController, rootViewController.presentedViewController == nil {
+                // Extensions run in a UIWindow where the rootViewController's frame is inset from the top
+                height = rootViewController.view.bounds.height
+            }
+            return height - window.convert(superView.frame, to: window).maxY
         }
         return 0
     }
@@ -158,8 +169,12 @@ open class KeyboardManager: NSObject, UIGestureRecognizerDelegate {
     ///
     /// - Parameter inputAccessoryView: The view to bind to the top of the keyboard but within its superview
     /// - Returns: Self
-@discardableResult
-open func bind(inputAccessoryView: UIView, withAdditionalBottomSpace additionalBottomSpace: (() -> CGFloat)? = .none) -> Self {
+    @discardableResult
+    open func bind<InputAccessoryView: UIView>(
+        inputAccessoryView: InputAccessoryView,
+        isActive: @escaping (InputAccessoryView) -> Bool = { _ in true },
+        withAdditionalBottomSpace additionalBottomSpace: (() -> CGFloat)? = .none
+    ) -> Self {
 
     guard let superview = inputAccessoryView.superview else {
         fatalError("`inputAccessoryView` must have a superview")
@@ -175,62 +190,73 @@ open func bind(inputAccessoryView: UIView, withAdditionalBottomSpace additionalB
 
     callbacks[.willShow] = { [weak self] (notification) in
         guard
-            self?.isKeyboardHidden == false,
-            self?.constraints?.bottom?.constant == self?.additionalInputViewBottomConstraintConstant(),
-            notification.isForCurrentApp
+            let self,
+            isKeyboardHidden == false,
+            constraints?.bottom?.constant == additionalInputViewBottomConstraintConstant(),
+            notification.isForCurrentApp,
+            let inputAccessoryView = self.inputAccessoryView as? InputAccessoryView
         else { return }
 
-        let keyboardHeight = notification.endFrame.height
+        let keyboardHeight = isActive(inputAccessoryView) ? notification.endFrame.height : 0
         let animateAlongside = {
-            self?.animateAlongside(notification) {
-                self?.constraints?.bottom?.constant = min(0, -keyboardHeight + (self?.bottomGap ?? 0)) - (additionalBottomSpace?() ?? 0)
-                self?.inputAccessoryView?.superview?.layoutIfNeeded()
+            self.animateAlongside(notification) {
+                self.constraints?.bottom?.constant = min(-34, -keyboardHeight + self.bottomGap) - (additionalBottomSpace?() ?? 0)
+                self.inputAccessoryView?.superview?.layoutIfNeeded()
             }
         }
         animateAlongside()
 
         // Trigger a new animation if gap changed, this typically happens when using pagesheet on portrait iPad
-        let initialBottomGap = self?.bottomGap ?? 0
-        DispatchQueue.main.async {
-            let newBottomGap = self?.bottomGap ?? 0
+        let initialBottomGap = bottomGap
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let newBottomGap = bottomGap
             if newBottomGap != 0 && newBottomGap != initialBottomGap {
                 animateAlongside()
             }
         }
     }
     callbacks[.willChangeFrame] = { [weak self] (notification) in
-        let keyboardHeight = notification.endFrame.height
         guard
-            self?.isKeyboardHidden == false,
-            notification.isForCurrentApp
+            let self,
+            isKeyboardHidden == false,
+            notification.isForCurrentApp,
+            let inputAccessoryView = self.inputAccessoryView as? InputAccessoryView
         else {
             return
         }
+        let keyboardHeight = isActive(inputAccessoryView) ? notification.endFrame.height : 0
         let animateAlongside = {
-            self?.animateAlongside(notification) {
-                self?.constraints?.bottom?.constant = min(0, -keyboardHeight + (self?.bottomGap ?? 0)) - (additionalBottomSpace?() ?? 0)
-                self?.inputAccessoryView?.superview?.layoutIfNeeded()
+            self.animateAlongside(notification) {
+                self.constraints?.bottom?.constant = min(-34, -keyboardHeight + self.bottomGap) - (additionalBottomSpace?() ?? 0)
+                self.inputAccessoryView?.superview?.layoutIfNeeded()
             }
         }
         animateAlongside()
         
         // Trigger a new animation if gap changed, this typically happens when using pagesheet on portrait iPad
-        let initialBottomGap = self?.bottomGap ?? 0
-        DispatchQueue.main.async {
-            let newBottomGap = self?.bottomGap ?? 0
-            if newBottomGap != 0 && newBottomGap != initialBottomGap && !(self?.justDidWillHide ?? false) {
+        let initialBottomGap = bottomGap
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let newBottomGap = bottomGap
+            if newBottomGap != 0 && newBottomGap != initialBottomGap && !(justDidWillHide) {
                 animateAlongside()
             }
         }
     }
     callbacks[.willHide] = { [weak self] (notification) in
-        guard notification.isForCurrentApp else { return }
-        self?.justDidWillHide = true
-        self?.animateAlongside(notification) { [weak self] in
-            self?.constraints?.bottom?.constant = self?.additionalInputViewBottomConstraintConstant() ?? 0
-            self?.inputAccessoryView?.superview?.layoutIfNeeded()
+        guard
+            let self,
+            notification.isForCurrentApp
+        else {
+            return
         }
-        DispatchQueue.main.async {
+        justDidWillHide = true
+        animateAlongside(notification) {
+            self.constraints?.bottom?.constant = self.additionalInputViewBottomConstraintConstant()
+            self.inputAccessoryView?.superview?.layoutIfNeeded()
+        }
+        DispatchQueue.main.async { [weak self] in
             self?.justDidWillHide = false
         }
     }
@@ -316,8 +342,20 @@ open func bind(inputAccessoryView: UIView, withAdditionalBottomSpace additionalB
 
     // MARK: - Helper Methods
 
-    private func animateAlongside(_ notification: KeyboardNotification, animations: @escaping ()->Void) {
-        UIView.animate(withDuration: notification.timeInterval, delay: 0, options: [notification.animationOptions, .allowAnimatedContent, .beginFromCurrentState], animations: animations, completion: nil)
+    private func animateAlongside(
+        _ notification: KeyboardNotification,
+        animations: @escaping () -> Void
+    ) {
+        UIView.animate(
+            withDuration: notification.timeInterval,
+            delay: 0,
+            options: [notification.animationOptions, .allowAnimatedContent, .beginFromCurrentState],
+            animations: {
+                animations()
+                self.transition?(notification)
+            },
+            completion: nil
+        )
     }
 
     // MARK: - UIGestureRecognizerDelegate
@@ -329,6 +367,9 @@ open func bind(inputAccessoryView: UIView, withAdditionalBottomSpace additionalB
     @objc
     open func handlePanGestureRecognizer(recognizer: UIPanGestureRecognizer) {
         guard
+            // Only follow drags that scroll the view. A drag another gesture claims (swipe to reply,
+            // back swipe) never dismisses the keyboard, so the bar would end up hidden behind it
+            scrollView?.isDragging == true,
             var keyboardNotification = cachedNotification,
             case .changed = recognizer.state,
             let view = recognizer.view,
@@ -336,9 +377,6 @@ open func bind(inputAccessoryView: UIView, withAdditionalBottomSpace additionalB
         else { return }
 
         guard
-            // if there's no difference in frames for the `cachedNotification`, no adjustment is necessary.
-            // This is true when the keyboard is completely dismissed, or our pan doesn't intersect below the keyboard
-            keyboardNotification.startFrame != keyboardNotification.endFrame,
             // when the width of the keyboard from endFrame is smaller than the width of scrollView manager is tracking
             // with panGesture, we can assume the keyboard is floatig ahd updating inputAccessoryView is not necessary
             keyboardNotification.endFrame.width >= view.frame.width
